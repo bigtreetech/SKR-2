@@ -163,7 +163,34 @@ bool BLTouch::stow_proc() {
 
   return false; // report success to caller
 }
+bool BLTouch::is_exist() {
+  // Attempt to DEPLOY, wait for DEPLOY_DELAY or ALARM
+  if (_deploy_query_alarm()) {
+    clear();                               // Get the probe into start condition
+    // Last attempt to DEPLOY
+    if (_deploy_query_alarm()) {
+      return false;                        // Tell our caller we goofed in case he cares to know
+    }
+  }
+  // One of the recommended ANTClabs ways to probe, using SW MODE
+  #if ENABLED(BLTOUCH_FORCE_SW_MODE)
+   _set_SW_mode();
+  #endif
 
+  // Attempt to STOW, wait for STOW_DELAY or ALARM
+  if (_stow_query_alarm()) {
+    _reset();                              // This RESET will then also pull up the pin. If it doesn't
+                                           // work and the pin is still down, there will no longer be
+                                           // an ALARM condition though.
+                                           // But one more STOW will catch that
+    // Last attempt to STOW
+    if (_stow_query_alarm()) {             // so if there is now STILL an ALARM condition:
+      return false;                        // Tell our caller we goofed in case he cares to know
+    }
+  }
+
+  return true; // Bltouch is exist
+}
 bool BLTouch::status_proc() {
   /**
    * Return a TRUE for "YES, it is DEPLOYED"

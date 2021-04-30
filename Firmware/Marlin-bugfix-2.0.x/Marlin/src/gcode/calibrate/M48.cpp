@@ -55,6 +55,16 @@ void GcodeSuite::M48() {
 
   if (homing_needed_error()) return;
 
+  #if ENABLED(BLTOUCH)
+    if(!probe.is_exist()) {  // probe not exist
+      #if HAS_DISPLAY        // It's means that the Bltouch is not ready
+        ui.status_printf_P(0, PSTR("Bltouch not ready!"));
+      #endif
+      SERIAL_ECHO_MSG("(Optional) Please check whether your printer has Bltouch");
+      return;
+    }
+  #endif
+
   const int8_t verbose_level = parser.byteval('V', 1);
   if (!WITHIN(verbose_level, 0, 4)) {
     SERIAL_ECHOLNPGM("?(V)erbose level implausible (0-4).");
@@ -117,7 +127,7 @@ void GcodeSuite::M48() {
         max = -99999.9, // Largest value sampled so far
         sample_set[n_samples];  // Storage for sampled values
 
-  auto dev_report = [](const bool verbose, const float &mean, const float &sigma, const float &min, const float &max, const bool final=false) {
+  auto dev_report = [](const bool verbose, const_float_t mean, const_float_t sigma, const_float_t min, const_float_t max, const bool final=false) {
     if (verbose) {
       SERIAL_ECHOPAIR_F("Mean: ", mean, 6);
       if (!final) SERIAL_ECHOPAIR_F(" Sigma: ", sigma, 6);
@@ -142,7 +152,7 @@ void GcodeSuite::M48() {
     float sample_sum = 0.0;
 
     LOOP_L_N(n, n_samples) {
-      #if HAS_WIRED_LCD
+      #if HAS_STATUS_MESSAGE
         // Display M48 progress in the status bar
         ui.status_printf_P(0, PSTR(S_FMT ": %d/%d"), GET_TEXT(MSG_M48_POINT), int(n + 1), int(n_samples));
       #endif
@@ -257,7 +267,7 @@ void GcodeSuite::M48() {
     SERIAL_ECHOLNPGM("Finished!");
     dev_report(verbose_level > 0, mean, sigma, min, max, true);
 
-    #if HAS_WIRED_LCD
+    #if HAS_STATUS_MESSAGE
       // Display M48 results in the status bar
       char sigma_str[8];
       ui.status_printf_P(0, PSTR(S_FMT ": %s"), GET_TEXT(MSG_M48_DEVIATION), dtostrf(sigma, 2, 6, sigma_str));

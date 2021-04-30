@@ -36,9 +36,10 @@
 
   // use USB drivers
 
-  extern "C" { int8_t SD_MSC_Read(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t blk_len);
-               int8_t SD_MSC_Write(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t blk_len);
-               extern SD_HandleTypeDef hsd;
+  extern "C" {
+    int8_t SD_MSC_Read(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t blk_len);
+    int8_t SD_MSC_Write(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t blk_len);
+    extern SD_HandleTypeDef hsd;
   }
 
   bool SDIO_Init() {
@@ -75,8 +76,18 @@
     #error "ERROR - Only STM32F103xE, STM32F103xG, STM32F4xx or STM32F7xx CPUs supported"
   #endif
 
-  SD_HandleTypeDef  hsd;  // create SDIO structure
-  DMA_HandleTypeDef dmaRx, dmaTx;
+  // Fixed
+  #define SDIO_D0_PIN   PC8
+  #define SDIO_D1_PIN   PC9
+  #define SDIO_D2_PIN   PC10
+  #define SDIO_D3_PIN   PC11
+  #define SDIO_CK_PIN   PC12
+  #define SDIO_CMD_PIN  PD2
+
+  SD_HandleTypeDef hsd;  // create SDIO structure
+  // F4 supports one DMA for RX and another for TX, but Marlin will never
+  // do read and write at same time, so we use the same DMA for both.
+  DMA_HandleTypeDef hdma_sdio;
 
   /*
     SDIO_INIT_CLK_DIV is 118
@@ -97,16 +108,12 @@
 
   // Target Clock, configurable. Default is 18MHz, from STM32F1
   #ifndef SDIO_CLOCK
-    #define SDIO_CLOCK                         18000000       /* 18 MHz */
+    #define SDIO_CLOCK 18000000 // 18 MHz
   #endif
 
   // SDIO retries, configurable. Default is 3, from STM32F1
   #ifndef SDIO_READ_RETRIES
-    #define SDIO_READ_RETRIES                  3
-  #endif
-
-  #ifndef SDIO_TIMEOUT_MS
-    #define SDIO_TIMEOUT_MS                    10  // 10 milliseconds
+    #define SDIO_READ_RETRIES 3
   #endif
 
   // SDIO Max Clock (naming from STM Manual, don't change)
@@ -124,118 +131,215 @@
     return pclk2 / clk + (pclk2 % clk != 0) - 2;
   }
 
-  extern "C" void SDMMC1_IRQHandler(void) {
-    HAL_SD_IRQHandler(&hsd);
+  void go_to_transfer_speed() {
+    /* Default SDIO peripheral configuration for SD card initialization */
+    hsd.Init.ClockEdge           = hsd.Init.ClockEdge;
+    hsd.Init.ClockBypass         = hsd.Init.ClockBypass;
+    hsd.Init.ClockPowerSave      = hsd.Init.ClockPowerSave;
+    hsd.Init.BusWide             = hsd.Init.BusWide;
+    hsd.Init.HardwareFlowControl = hsd.Init.HardwareFlowControl;
+    hsd.Init.ClockDiv            = clock_to_divider(SDIO_CLOCK);
+
+    /* Initialize SDIO peripheral interface with default configuration */
+    SDIO_Init(hsd.Instance, hsd.Init);
   }
 
-  extern "C" void DMA2_Stream6_IRQHandler(void) {
-    HAL_DMA_IRQHandler(hsd.hdmatx);
+  void SD_LowLevel_Init(void) {
+    uint32_t tempreg;
+
+    __HAL_RCC_GPIOC_CLK_ENABLE(); //enable GPIO clocks
+    __HAL_RCC_GPIOD_CLK_ENABLE(); //enable GPIO clocks
+
+    GPIO_InitTypeDef  GPIO_InitStruct;
+
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = 1;  //GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+
+    #if DISABLED(STM32F1xx)
+      GPIO_InitStruct.Alternate = GPIO_AF12_SDIO;
+    #endif
+
+    GPIO_InitStruct.Pin = GPIO_PIN_8 | GPIO_PIN_12;  // D0 & SCK
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    #if PINS_EXIST(SDIO_D1, SDIO_D2, SDIO_D3)  // define D1-D3 only if have a four bit wide SDIO bus
+      GPIO_InitStruct.Pin = GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11;  // D1-D3
+      HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    #endif
+
+    // Configure PD.02 CMD line
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+    // Setup DMA
+    #if defined(STM32F1xx)
+      hdma_sdio.Init.Mode = DMA_NORMAL;
+      hdma_sdio.Instance = DMA2_Channel4;
+      HAL_NVIC_EnableIRQ(DMA2_Channel4_5_IRQn);
+    #elif defined(STM32F4xx)
+      hdma_sdio.Init.Mode = DMA_PFCTRL;
+      hdma_sdio.Instance = DMA2_Stream3;
+      hdma_sdio.Init.Channel = DMA_CHANNEL_4;
+      hdma_sdio.Init.FIFOMode = DMA_FIFOMODE_ENABLE;
+      hdma_sdio.Init.FIFOThreshold = DMA_FIFO_THRESHOLD_FULL;
+      hdma_sdio.Init.MemBurst = DMA_MBURST_INC4;
+      hdma_sdio.Init.PeriphBurst = DMA_PBURST_INC4;
+      HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+    #endif
+    HAL_NVIC_EnableIRQ(SDIO_IRQn);
+    hdma_sdio.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_sdio.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_sdio.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    hdma_sdio.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_sdio.Init.Priority = DMA_PRIORITY_LOW;
+    __HAL_LINKDMA(&hsd, hdmarx, hdma_sdio);
+    __HAL_LINKDMA(&hsd, hdmatx, hdma_sdio);
+
+    #if defined(STM32F1xx)
+      __HAL_RCC_SDIO_CLK_ENABLE();
+      __HAL_RCC_DMA2_CLK_ENABLE();
+    #else
+      __HAL_RCC_SDIO_FORCE_RESET();
+      delay(2);
+      __HAL_RCC_SDIO_RELEASE_RESET();
+      delay(2);
+      __HAL_RCC_SDIO_CLK_ENABLE();
+
+      __HAL_RCC_DMA2_FORCE_RESET();
+      delay(2);
+      __HAL_RCC_DMA2_RELEASE_RESET();
+      delay(2);
+      __HAL_RCC_DMA2_CLK_ENABLE();
+    #endif
+
+    //Initialize the SDIO (with initial <400Khz Clock)
+    tempreg = 0;  //Reset value
+    tempreg |= SDIO_CLKCR_CLKEN;  // Clock enabled
+    tempreg |= SDIO_INIT_CLK_DIV; // Clock Divider. Clock = 48000 / (118 + 2) = 400Khz
+    // Keep the rest at 0 => HW_Flow Disabled, Rising Clock Edge, Disable CLK ByPass, Bus Width = 0, Power save Disable
+    SDIO->CLKCR = tempreg;
+
+    // Power up the SDIO
+    SDIO_PowerState_ON(SDIO);
+    hsd.Instance = SDIO;
   }
 
-  extern "C" void DMA2_Stream3_IRQHandler(void) {
-    HAL_DMA_IRQHandler(hsd.hdmarx);
-  }
-
-  void HAL_InitDmaStream(DMA_HandleTypeDef& hdma, DMA_Stream_TypeDef *inst, uint32_t chan, IRQn_Type irq, uint32_t dir, uint32_t minc) {
-    hdma.Instance                 = inst;
-    hdma.Init.Channel             = chan;
-    hdma.Init.Direction           = dir;
-    hdma.Init.PeriphInc           = DMA_PINC_DISABLE;
-    hdma.Init.MemInc              = minc;
-    hdma.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
-    hdma.Init.MemDataAlignment    = DMA_MDATAALIGN_WORD;
-    hdma.Init.Mode                = DMA_PFCTRL;
-    hdma.Init.Priority            = DMA_PRIORITY_LOW;
-    hdma.Init.FIFOMode            = DMA_FIFOMODE_ENABLE;
-    hdma.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
-    hdma.Init.MemBurst            = DMA_MBURST_INC4;
-    hdma.Init.PeriphBurst         = DMA_PBURST_INC4;
-
-    HAL_DMA_DeInit(&hdma);
-    HAL_DMA_Init(&hdma);
-    HAL_NVIC_EnableIRQ(irq);
+  void HAL_SD_MspInit(SD_HandleTypeDef *hsd) { // application specific init
+    UNUSED(hsd);   // Prevent unused argument(s) compilation warning
+    __HAL_RCC_SDIO_CLK_ENABLE();  // turn on SDIO clock
   }
 
   bool SDIO_Init() {
+    uint8_t retryCnt = SDIO_READ_RETRIES;
 
-    uint8_t SD_Error;
-    __HAL_RCC_SDIO_FORCE_RESET();
-    delay(2);
-    __HAL_RCC_SDIO_RELEASE_RESET();
-    delay(2);
-    __HAL_RCC_SDIO_CLK_ENABLE();
-
+    bool status;
     hsd.Instance = SDIO;
-    hsd.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
-    hsd.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
-    hsd.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
-    hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
-    hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
-    hsd.Init.ClockDiv = clock_to_divider(SDIO_CLOCK);
+    hsd.State = HAL_SD_STATE_RESET;
 
-    pinmap_pinout(PC_8, PinMap_SD);
-    pinmap_pinout(PC_12, PinMap_SD);
-    pinmap_pinout(PD_2, PinMap_SD);
-    #if PINS_EXIST(SDIO_D1, SDIO_D2, SDIO_D3) // go to 4 bit wide mode if pins are defined
-      pinmap_pinout(PC_9, PinMap_SD);
-      pinmap_pinout(PC_10, PinMap_SD);
-      pinmap_pinout(PC_11, PinMap_SD);
-    #endif
+    SD_LowLevel_Init();
 
-    __HAL_RCC_DMA2_FORCE_RESET();
-    delay(2);
-    __HAL_RCC_DMA2_RELEASE_RESET();
-    delay(2);
-    __HAL_RCC_DMA2_CLK_ENABLE();
-    HAL_InitDmaStream(dmaRx, DMA2_Stream3, DMA_CHANNEL_4, DMA2_Stream3_IRQn, DMA_PERIPH_TO_MEMORY, DMA_MINC_ENABLE);
-    __HAL_LINKDMA(&hsd, hdmarx, dmaRx);
-    HAL_InitDmaStream(dmaTx, DMA2_Stream6, DMA_CHANNEL_4, DMA2_Stream6_IRQn, DMA_MEMORY_TO_PERIPH, DMA_MINC_ENABLE);
-    __HAL_LINKDMA(&hsd, hdmatx, dmaTx);
+    uint8_t retry_Cnt = retryCnt;
+    for (;;) {
+      TERN_(USE_WATCHDOG, HAL_watchdog_refresh());
+      status = (bool) HAL_SD_Init(&hsd);
+      if (!status) break;
+      if (!--retry_Cnt) return false;   // return failing status if retries are exhausted
+    }
 
-    SD_Error = HAL_SD_Init(&hsd);
-    if(SD_Error != HAL_OK) return false;
+    go_to_transfer_speed();
 
     #if PINS_EXIST(SDIO_D1, SDIO_D2, SDIO_D3) // go to 4 bit wide mode if pins are defined
-      SD_Error = HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B);
-      if(SD_Error != HAL_OK) return false;
+      retry_Cnt = retryCnt;
+      for (;;) {
+        TERN_(USE_WATCHDOG, HAL_watchdog_refresh());
+        if (!HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B)) break;  // some cards are only 1 bit wide so a pass here is not required
+        if (!--retry_Cnt) break;
+      }
+      if (!retry_Cnt) {  // wide bus failed, go back to one bit wide mode
+        hsd.State = (HAL_SD_StateTypeDef) 0;  // HAL_SD_STATE_RESET
+        SD_LowLevel_Init();
+        retry_Cnt = retryCnt;
+        for (;;) {
+          TERN_(USE_WATCHDOG, HAL_watchdog_refresh());
+          status = (bool) HAL_SD_Init(&hsd);
+          if (!status) break;
+          if (!--retry_Cnt) return false;   // return failing status if retries are exhausted
+        }
+        go_to_transfer_speed();
+      }
     #endif
 
-    HAL_NVIC_EnableIRQ(SDMMC1_IRQn);
+    return true;
+  }
+
+  static bool SDIO_ReadWriteBlock_DMA(uint32_t block, const uint8_t *src, uint8_t *dst) {
+    if (HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER) return false;
+
+    TERN_(USE_WATCHDOG, HAL_watchdog_refresh());
+
+    HAL_StatusTypeDef ret;
+    if (src) {
+      hdma_sdio.Init.Direction = DMA_MEMORY_TO_PERIPH;
+      HAL_DMA_Init(&hdma_sdio);
+      ret = HAL_SD_WriteBlocks_DMA(&hsd, (uint8_t *)src, block, 1);
+    }
+    else {
+      hdma_sdio.Init.Direction = DMA_PERIPH_TO_MEMORY;
+      HAL_DMA_Init(&hdma_sdio);
+      ret = HAL_SD_ReadBlocks_DMA(&hsd, (uint8_t *)dst, block, 1);
+    }
+
+    if (ret != HAL_OK) {
+      HAL_DMA_Abort_IT(&hdma_sdio);
+      HAL_DMA_DeInit(&hdma_sdio);
+      return false;
+    }
+
+    millis_t timeout = millis() + 500;
+    // Wait the transfer
+    while (hsd.State != HAL_SD_STATE_READY) {
+      if (ELAPSED(millis(), timeout)) {
+        HAL_DMA_Abort_IT(&hdma_sdio);
+        HAL_DMA_DeInit(&hdma_sdio);
+        return false;
+      }
+    }
+
+    while (__HAL_DMA_GET_FLAG(&hdma_sdio, __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_sdio)) != 0
+        || __HAL_DMA_GET_FLAG(&hdma_sdio, __HAL_DMA_GET_TE_FLAG_INDEX(&hdma_sdio)) != 0) { /* nada */ }
+
+    HAL_DMA_Abort_IT(&hdma_sdio);
+    HAL_DMA_DeInit(&hdma_sdio);
+
+    timeout = millis() + 500;
+    while (HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER) if (ELAPSED(millis(), timeout)) return false;
 
     return true;
   }
 
   bool SDIO_ReadBlock(uint32_t block, uint8_t *dst) {
-
-    if (HAL_SD_ReadBlocks_DMA(&hsd, (uint8_t *)dst, block, 1) != HAL_OK) {
-      return false;
-    }
-
-    uint32_t start = millis() + SDIO_TIMEOUT_MS;
-    while(HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER) {
-      if (millis() > start) {
-        return false;
-      }
-    }
-
-    return true;
+    uint8_t retries = SDIO_READ_RETRIES;
+    while (retries--) if (SDIO_ReadWriteBlock_DMA(block, NULL, dst)) return true;
+    return false;
   }
 
   bool SDIO_WriteBlock(uint32_t block, const uint8_t *src) {
-
-    if (HAL_SD_WriteBlocks_DMA(&hsd, (uint8_t *)src, block, 1) != HAL_OK) {
-      return false;
-    }
-
-    uint32_t start = millis() + SDIO_TIMEOUT_MS;
-    while(HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER) {
-      if (millis() > start) {
-        return false;
-      }
-    }
-
-    return true;
+    uint8_t retries = SDIO_READ_RETRIES;
+    while (retries--) if (SDIO_ReadWriteBlock_DMA(block, src, NULL)) return true;
+    return false;
   }
+
+  #if defined(STM32F1xx)
+    #define DMA_IRQ_HANDLER DMA2_Channel4_5_IRQHandler
+  #elif defined(STM32F4xx)
+    #define DMA_IRQ_HANDLER DMA2_Stream3_IRQHandler
+  #else
+    #error "Unknown STM32 architecture."
+  #endif
+
+  extern "C" void SDIO_IRQHandler(void) { HAL_SD_IRQHandler(&hsd); }
+  extern "C" void DMA_IRQ_HANDLER(void) { HAL_DMA_IRQHandler(&hdma_sdio); }
 
 #endif // !USBD_USE_CDC_COMPOSITE
 #endif // SDIO_SUPPORT
